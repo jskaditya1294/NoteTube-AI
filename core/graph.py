@@ -4,9 +4,9 @@ from typing import Literal
 
 from langgraph.graph import StateGraph, START, END
 
-from state import NotesWorkflowState, MAX_ITERATIONS
-from nodes import fetch_transcript, fetch_important_frames_node, generate_notes, review_quality, revise_notes, generate_notes_qa
-from interview_nodes import (
+from core.state import NotesWorkflowState, MAX_ITERATIONS
+from nodes.notes import fetch_transcript, fetch_important_frames_node, generate_notes, review_quality, revise_notes, generate_notes_qa
+from nodes.interview import (
     interview_topic_miner,
     interview_question_harvester,
     interview_critic,

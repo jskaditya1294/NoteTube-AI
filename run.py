@@ -13,10 +13,10 @@ try:
 except ImportError:
     pass
 
-from video import extract_video_id
-from graph import graph
-from state import NotesWorkflowState
-from export_utils import (
+from services.video import extract_video_id
+from core.graph import graph
+from core.state import NotesWorkflowState
+from utils.export import (
     save_notes_as_md_and_docx,
     save_combined_questions,
 )

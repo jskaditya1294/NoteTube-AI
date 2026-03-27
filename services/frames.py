@@ -244,7 +244,7 @@ def _pick_top_n(frames: list[dict], max_n: int) -> list[dict]:
     """Use text-only LLM to pick the top max_n most useful frames by caption/timestamp."""
     if len(frames) <= max_n:
         return frames
-    from prompts import FRAME_TOP_N_SYSTEM
+    from prompts.notes import FRAME_TOP_N_SYSTEM
     lines = [f"{i+1}. [{int(f['timestamp_sec'])}s] {f.get('caption', '')}" for i, f in enumerate(frames)]
     prompt = f"""Candidates (number, timestamp, caption):
 {chr(10).join(lines)}

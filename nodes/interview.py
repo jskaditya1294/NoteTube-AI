@@ -9,14 +9,14 @@ from typing import Any
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from state import NotesWorkflowState, MAX_INTERVIEW_LOOPS
-from prompts_interview import (
+from core.state import NotesWorkflowState, MAX_INTERVIEW_LOOPS
+from prompts.interview import (
     NODE1_TOPIC_MINER_SYSTEM,
     NODE2_QUESTION_HARVESTER_SYSTEM,
     NODE2_QUESTION_HARVESTER_RETRY,
     NODE3_CRITIC_SYSTEM,
 )
-from interview_search import (
+from services.search import (
     gather_interview_source_blob,
     build_search_queries_for_topic,
     build_global_queries_from_topics,

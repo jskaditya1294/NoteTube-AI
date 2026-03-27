@@ -1,0 +1,36 @@
+# =============================================================================
+# .dockerignore — files/folders Docker should IGNORE when building the image.
+# Works exactly like .gitignore but for "docker build" context.
+# Without this, "COPY . /app" (or the build context) would include everything.
+# =============================================================================
+
+# Python virtual environment (~500 MB+ of installed packages).
+# The image installs its own dependencies via pip, so .venv is redundant.
+.venv/
+
+# Compiled Python bytecode files — regenerated automatically at runtime.
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Git metadata — not needed inside a running container.
+.git/
+.gitignore
+
+# IDE / editor config — development-only files.
+.cursor/
+
+# Secret files — NEVER bake API keys into an image!
+# Pass them at runtime via:  docker run --env-file .env ...
+#                        or:  docker run -e OPENAI_API_KEY=sk-... ...
+.env
+.env.*
+
+# Generated output files — mount a volume instead so outputs persist
+# on your host machine:  docker run -v ./outputs:/app/outputs ...
+outputs/
+
+# Misc files not needed in the image
+*.png
+*.md
+!README.md

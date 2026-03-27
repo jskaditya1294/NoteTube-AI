@@ -5,10 +5,10 @@ from pathlib import Path
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
-from state import NotesWorkflowState, MAX_ITERATIONS
-from video import extract_video_id, get_transcript
-from frames import fetch_important_frames, MAX_IMPORTANT_FRAMES
-from prompts import (
+from core.state import NotesWorkflowState, MAX_ITERATIONS
+from services.video import extract_video_id, get_transcript
+from services.frames import fetch_important_frames, MAX_IMPORTANT_FRAMES
+from prompts.notes import (
     NOTES_GENERATOR_SYSTEM,
     NOTES_REVISER_SYSTEM,
     REVIEWER_SYSTEM,
@@ -18,14 +18,11 @@ from prompts import (
     parse_review_response,
     NOTES_QA_GENERATOR_SYSTEM,
     user_prompt_generate_qa,
-)
-
-from chunking import build_overlapping_chunks, estimate_tokens
-from prompts import (
     MERGE_NOTES_SYSTEM,
     user_prompt_generate_chunk_notes,
     user_prompt_merge_chunk_notes,
 )
+from utils.chunking import build_overlapping_chunks, estimate_tokens
 
 
 # Best choice if available in your deployment
