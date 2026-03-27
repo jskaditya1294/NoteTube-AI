@@ -1,0 +1,11 @@
+langgraph
+langchain-core
+langchain-openai
+youtube-transcript-api
+python-dotenv
+python-docx
+yt-dlp
+opencv-python
+numpy
+duckduckgo-search
+tavily-python
