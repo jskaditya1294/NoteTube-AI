@@ -1,11 +1,14 @@
 """Prompts for the notes generator (LLM 1) and quality reviewer (LLM 2)."""
 
 MATH_FORMAT_RULE = (
-    "Math: Use only readable inline form — Unicode symbols (η, ∂, Δ, ≤, ≥, ×, ·, etc.) "
-    "and single backticks for variables or short expressions, e.g. "
-    "`w_new = w_old - η * (∂L/∂w_old)`. Do not use LaTeX: no \\( ... \\), "
-    "no \\[ ... \\], no \\frac{}{}, \\partial, \\cdot, \\text{}, or other "
-    "LaTeX commands — they will not display correctly in the final document."
+    "Math: Use KaTeX (LaTeX) notation for all equations. "
+    "Wrap inline math in single dollar signs, e.g. $\\sigma(x)$, $e^{-x}$, $\\frac{\\partial L}{\\partial w}$. "
+    "Use double dollar signs on their own line for important or complex equations, e.g.\n"
+    "$$w_{\\text{new}} = w_{\\text{old}} - \\eta \\cdot \\frac{\\partial L}{\\partial w_{\\text{old}}}$$\n"
+    "Use proper LaTeX commands: \\frac{}{} for fractions, ^{} for superscripts, _{} for subscripts, "
+    "\\cdot for multiplication, \\partial for partial derivatives, \\sigma, \\eta, \\alpha, \\lambda, etc. for Greek letters, "
+    "\\text{} for text inside math, \\bigl/\\bigr for large delimiters, \\boxed{} for final key results. "
+    "Never use plain-text hacks like e^(-x) or d/dx — always use proper LaTeX rendering."
 )
 
 
@@ -124,7 +127,7 @@ Your goal: Produce a revised version that incorporates all feedback while mainta
    - Keep sentences technical and precise.
    - Eliminate all filler and repetition.
 4. Consistency: Do not lose the high-quality points from the previous draft that were already correct.
-5. Math: Keep or convert all equations to readable inline form (Unicode + backticks). No LaTeX.
+5. Math: Keep or convert all equations to KaTeX (LaTeX) notation — $...$ for inline, $$...$$ for display blocks.
 
 Strict Rule: Do not add outside information. Use only the provided transcript and feedback.
 
@@ -140,7 +143,7 @@ Evaluation Criteria:
 2. Technical Accuracy: Are definitions and processes captured correctly without oversimplification?
 3. Information Density: Is there any "fluff" or "filler" remaining? Are there any major concepts from the transcript missing?
 4. Formatting: Is it clean, professional, and easy to skim?
-5. Math format: Equations must be in readable inline form (Unicode + backticks). FAIL if LaTeX (e.g. \\(, \\), \\frac, \\partial, \\cdot, \\text{}) appears.
+5. Math format: Equations must use KaTeX (LaTeX) notation — $...$ for inline, $$...$$ for display. FAIL if plain-text hacks (e.g. e^(-x), d/dx, backtick-wrapped math) appear instead of proper LaTeX.
 
 Response Protocol:
 - Start your response with EXACTLY one word: PASS or FAIL.

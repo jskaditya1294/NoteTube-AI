@@ -4,6 +4,7 @@
 
 import argparse
 import re
+import shutil
 from pathlib import Path
 
 # Load .env first so OPENAI_API_KEY and TAVILY_API_KEY are available
@@ -46,12 +47,6 @@ def main() -> None:
         help="Save the LangGraph workflow Mermaid text to a .mmd file"
     )
     parser.add_argument(
-        "--max-images",
-        type=int,
-        default=6,
-        help="Max number of key images to include in notes (default: 6)"
-    )
-    parser.add_argument(
         "--skip-interview",
         action="store_true",
         help="Skip interview question mining (web search + Node1–3 graph)"
@@ -89,7 +84,6 @@ def main() -> None:
         "video_id": video_id,
         "transcript": "",
         "output_dir": str(out_dir.resolve()),
-        "max_important_frames": args.max_images,
         "important_frames": [],
         "frames_error": "",
         "notes": "",
@@ -151,6 +145,38 @@ def main() -> None:
             )
             print("Saved markdown:", saved["markdown_path"])
             print("Saved docx    :", saved["docx_path"])
+
+            # Move extracted frames into the topic folder
+            if important_frames:
+                frames_dest = topic_dir / f"imp_frames_{safe_topic}"
+                frames_dest.mkdir(parents=True, exist_ok=True)
+                moved = 0
+                for frame in important_frames:
+                    src = Path(frame.get("path", ""))
+                    if src.exists():
+                        dst = frames_dest / src.name
+                        shutil.move(str(src), str(dst))
+                        frame["path"] = str(dst.resolve())
+                        moved += 1
+                if moved:
+                    print(f"Moved {moved} frames to: {frames_dest.resolve()}")
+
+                # Clean up the old video_id folder if empty
+                old_frames_dir = out_dir / video_id / "frames"
+                if old_frames_dir.exists() and not any(old_frames_dir.iterdir()):
+                    old_frames_dir.rmdir()
+                old_video_dir = out_dir / video_id
+                if old_video_dir.exists() and not any(old_video_dir.iterdir()):
+                    old_video_dir.rmdir()
+
+                # Re-save markdown so image paths point to the new location
+                saved = save_notes_as_md_and_docx(
+                    notes=final_notes,
+                    output_dir=str(topic_dir),
+                    video_id=video_id,
+                    title=topic_title,
+                    important_frames=important_frames,
+                )
 
             # Save combined questions: <topic>_questions.md/docx
             qa_md = (result.get("notes_qa_markdown") or "").strip()

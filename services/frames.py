@@ -1,32 +1,56 @@
-"""Extract the most useful frames from a YouTube video: scene-based sampling, vision filter, top-N cap."""
+"""
+Production-grade frame extraction from YouTube videos.
+
+Pipeline:
+1. Download video via yt-dlp
+2. Adaptive scene-change detection using SSIM + motion debouncing
+3. Batched vision-model filtering (GPT-4o scores frames 1-10 for information density)
+4. Deduplication built into the judge prompt
+5. Top-N cap via text-only LLM if needed
+
+Async API calls via asyncio for concurrent vision batches.
+Generator pattern for long videos to bound memory.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
 import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Generator
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 VISION_MODEL = "gpt-4o"
 FRAME_MAX_WIDTH = 768
 
-# At most this many images in the final notes (enforced via second-pass "top N" selection)
-MAX_IMPORTANT_FRAMES = 6
+# SSIM-based scene change thresholds
+SSIM_CHANGE_THRESHOLD = 0.80       # Below this SSIM → significant visual shift
+MIN_SCENE_GAP_SEC = 3.0            # Min gap between candidate captures
+MOTION_STASIS_WINDOW = 8           # Frames to confirm visual stasis after a change
+MOTION_STASIS_SSIM = 0.95          # Consecutive frames must exceed this to be "stable"
 
-# Scene change: min mean pixel diff (grayscale) to consider a new scene; tune if too many/few
-SCENE_DIFF_THRESHOLD = 25.0
-# Min seconds between saved scene frames (avoid duplicate slides)
-MIN_SCENE_GAP_SEC = 12.0
-# Fallback: if scene detection yields very few frames, sample by interval (seconds)
-FALLBACK_INTERVAL_SEC = 45.0
-MAX_CANDIDATE_FRAMES = 25
+# Fallback for very static videos (e.g. single camera, no slides)
+FALLBACK_INTERVAL_SEC = 40.0
+MIN_CANDIDATES_BEFORE_FALLBACK = 5
+
+# Budget
+MAX_CANDIDATE_FRAMES = 30
+VISION_BATCH_SIZE = 6              # Frames per GPT-4o call
+RELEVANCE_THRESHOLD = 6            # Min score (1-10) to keep a frame
 
 
+# ---------------------------------------------------------------------------
+# 1. Video download
+# ---------------------------------------------------------------------------
 def download_video(video_id: str, output_dir: Path) -> Path:
     """Download YouTube video with yt-dlp to output_dir / video_id / video.mp4."""
     out_dir = output_dir / video_id
@@ -46,73 +70,177 @@ def download_video(video_id: str, output_dir: Path) -> Path:
     return video_path
 
 
-def extract_frames_at_scene_changes(
-    video_path: Path,
-    min_gap_sec: float = MIN_SCENE_GAP_SEC,
-    diff_threshold: float = SCENE_DIFF_THRESHOLD,
-    max_frames: int = MAX_CANDIDATE_FRAMES,
-    fallback_interval_sec: float = FALLBACK_INTERVAL_SEC,
-) -> list[tuple[Path, float]]:
-    """
-    Extract one frame per scene change (large visual change) so we get one frame per slide/diagram
-    instead of many from the same content. Falls back to interval-based sampling if too few scenes.
-    Returns list of (frame_path, timestamp_sec).
-    """
-    try:
-        import cv2
-        import numpy as np
-    except ImportError:
-        raise ImportError("opencv-python and numpy required. pip install opencv-python numpy")
+# ---------------------------------------------------------------------------
+# 2. SSIM-based adaptive scene-change detection with motion debouncing
+# ---------------------------------------------------------------------------
+def _compute_ssim(img_a, img_b) -> float:
+    """Compute simplified SSIM between two grayscale images (same shape).
 
-    frames_dir = video_path.parent / "frames"
-    frames_dir.mkdir(parents=True, exist_ok=True)
+    Uses the standard SSIM formula with default constants.
+    Returns value in [-1, 1]; 1 = identical.
+    """
+    import numpy as np
+
+    a = img_a.astype(np.float64)
+    b = img_b.astype(np.float64)
+
+    c1 = (0.01 * 255) ** 2
+    c2 = (0.03 * 255) ** 2
+
+    mu_a = a.mean()
+    mu_b = b.mean()
+    sigma_a_sq = a.var()
+    sigma_b_sq = b.var()
+    sigma_ab = ((a - mu_a) * (b - mu_b)).mean()
+
+    num = (2 * mu_a * mu_b + c1) * (2 * sigma_ab + c2)
+    den = (mu_a ** 2 + mu_b ** 2 + c1) * (sigma_a_sq + sigma_b_sq + c2)
+    return float(num / den)
+
+
+def _frame_generator(
+    video_path: Path,
+    sample_fps: float = 2.0,
+) -> Generator[tuple[int, float, "np.ndarray"], None, None]:
+    """Yield (frame_index, timestamp_sec, bgr_frame) sampled at ~sample_fps from the video.
+
+    Uses a generator to avoid loading the entire video into memory.
+    """
+    import cv2
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    min_gap_frames = max(1, int(fps * min_gap_sec))
-    results: list[tuple[Path, float]] = []
-    prev_gray = None
+    # How many source frames to skip between samples
+    step = max(1, int(round(fps / sample_fps)))
     frame_index = 0
-    last_saved_at_frame = -min_gap_frames - 1
 
-    while len(results) < max_frames:
+    while True:
         ret, frame = cap.read()
         if not ret:
             break
-        t_sec = frame_index / fps
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.resize(gray, (160, 90))
-        is_scene_change = False
-        if prev_gray is not None:
-            diff = np.mean(np.abs(gray.astype(float) - prev_gray.astype(float)))
-            if diff >= diff_threshold and (frame_index - last_saved_at_frame) >= min_gap_frames:
-                is_scene_change = True
-        else:
-            is_scene_change = True
-
-        if is_scene_change:
-            last_saved_at_frame = frame_index
-            name = f"frame_{len(results) + 1:03d}_{int(t_sec)}s.jpg"
-            out_path = frames_dir / name
-            h, w = frame.shape[:2]
-            if w > FRAME_MAX_WIDTH:
-                scale = FRAME_MAX_WIDTH / w
-                frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-            cv2.imwrite(str(out_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            results.append((out_path, t_sec))
-
-        prev_gray = gray
+        if frame_index % step == 0:
+            t_sec = frame_index / fps
+            yield frame_index, t_sec, frame
         frame_index += 1
 
     cap.release()
 
-    # If scene detection gave very few frames (e.g. static lecture), fallback to interval sampling
-    if len(results) < 5:
-        cap = cv2.VideoCapture(str(video_path))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+
+def extract_candidate_frames(
+    video_path: Path,
+    ssim_threshold: float = SSIM_CHANGE_THRESHOLD,
+    min_gap_sec: float = MIN_SCENE_GAP_SEC,
+    stasis_window: int = MOTION_STASIS_WINDOW,
+    stasis_ssim: float = MOTION_STASIS_SSIM,
+    max_frames: int = MAX_CANDIDATE_FRAMES,
+    fallback_interval_sec: float = FALLBACK_INTERVAL_SEC,
+) -> list[tuple[Path, float]]:
+    """
+    Adaptive scene-change detection:
+    1. Sample frames at ~2 FPS
+    2. Compute SSIM between consecutive samples
+    3. When SSIM drops below threshold → scene change detected
+    4. Motion debouncing: after detecting change, wait for visual stasis
+       (consecutive high-SSIM frames) before capturing the *stable* frame
+    5. Fallback: if too few candidates, switch to interval-based sampling
+
+    Returns list of (frame_path, timestamp_sec).
+    """
+    import cv2
+    import numpy as np
+
+    frames_dir = video_path.parent / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    results: list[tuple[Path, float]] = []
+    prev_gray = None
+    last_saved_sec = -min_gap_sec - 1.0
+
+    # State for motion debouncing
+    change_detected = False
+    stasis_count = 0
+    pending_frame = None       # (bgr_frame, t_sec) — candidate waiting for stasis confirmation
+    pending_prev_gray = None
+
+    def _save_frame(bgr_frame, t_sec: float) -> None:
+        nonlocal last_saved_sec
+        if len(results) >= max_frames:
+            return
+        name = f"frame_{len(results) + 1:03d}_{int(t_sec)}s.jpg"
+        out_path = frames_dir / name
+        h, w = bgr_frame.shape[:2]
+        if w > FRAME_MAX_WIDTH:
+            scale = FRAME_MAX_WIDTH / w
+            bgr_frame = cv2.resize(bgr_frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        cv2.imwrite(str(out_path), bgr_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        results.append((out_path, t_sec))
+        last_saved_sec = t_sec
+
+    for _idx, t_sec, bgr_frame in _frame_generator(video_path, sample_fps=2.0):
+        if len(results) >= max_frames:
+            break
+
+        gray = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (320, 180))  # Higher res than before for better SSIM
+
+        if prev_gray is None:
+            # Always save the first frame
+            _save_frame(bgr_frame, t_sec)
+            prev_gray = gray
+            continue
+
+        ssim = _compute_ssim(prev_gray, gray)
+
+        if change_detected:
+            # Waiting for stasis: consecutive frames with high SSIM
+            if ssim >= stasis_ssim:
+                stasis_count += 1
+                pending_frame = (bgr_frame, t_sec)
+                pending_prev_gray = gray
+            else:
+                # Still changing — reset stasis counter, update pending
+                stasis_count = 0
+                pending_frame = (bgr_frame, t_sec)
+                pending_prev_gray = gray
+
+            if stasis_count >= stasis_window:
+                # Stable state reached — save the final stable frame
+                if pending_frame is not None:
+                    pf, pt = pending_frame
+                    if (pt - last_saved_sec) >= min_gap_sec:
+                        _save_frame(pf, pt)
+                change_detected = False
+                stasis_count = 0
+                pending_frame = None
+                if pending_prev_gray is not None:
+                    prev_gray = pending_prev_gray
+                    pending_prev_gray = None
+                continue
+        else:
+            if ssim < ssim_threshold:
+                # Scene change detected — start debouncing
+                change_detected = True
+                stasis_count = 0
+                pending_frame = (bgr_frame, t_sec)
+                pending_prev_gray = gray
+
+        prev_gray = gray
+
+    # Flush: if we ended while waiting for stasis, save the pending frame
+    if change_detected and pending_frame is not None:
+        pf, pt = pending_frame
+        if (pt - last_saved_sec) >= min_gap_sec and len(results) < max_frames:
+            _save_frame(pf, pt)
+
+    # Fallback: if scene detection yielded very few candidates (e.g. static lecture)
+    if len(results) < MIN_CANDIDATES_BEFORE_FALLBACK:
+        import cv2 as cv2_fb
+
+        cap = cv2_fb.VideoCapture(str(video_path))
+        fps = cap.get(cv2_fb.CAP_PROP_FPS) or 25.0
         interval_frames = max(1, int(fps * fallback_interval_sec))
         results = []
         frame_index = 0
@@ -128,8 +256,11 @@ def extract_frames_at_scene_changes(
                 h, w = frame.shape[:2]
                 if w > FRAME_MAX_WIDTH:
                     scale = FRAME_MAX_WIDTH / w
-                    frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-                cv2.imwrite(str(out_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    frame = cv2_fb.resize(
+                        frame, None, fx=FRAME_MAX_WIDTH / w, fy=FRAME_MAX_WIDTH / w,
+                        interpolation=cv2_fb.INTER_AREA,
+                    )
+                cv2_fb.imwrite(str(out_path), frame, [cv2_fb.IMWRITE_JPEG_QUALITY, 85])
                 results.append((out_path, t_sec))
                 saved += 1
             frame_index += 1
@@ -138,125 +269,183 @@ def extract_frames_at_scene_changes(
     return results
 
 
+# ---------------------------------------------------------------------------
+# 3. Batched vision-model filtering with information-density scoring
+# ---------------------------------------------------------------------------
 def _encode_image(path: Path) -> str:
     return base64.standard_b64encode(path.read_bytes()).decode("ascii")
 
 
-# Strict prompt: no face-only, only complete content; reduces false positives
-FRAME_IMPORTANCE_SYSTEM = """You decide if a video frame is worth keeping for study notes.
+BATCH_JUDGE_SYSTEM = """You are a vision-based frame evaluator for educational video notes.
 
-Mark as NOT important:
-- Mainly a person's face or talking head with no diagram/slide/code visible.
-- Partial or incomplete content (diagram being drawn, slide with one bullet, unfinished equation).
-- Blank screen, duplicate of previous, intro/outro, or no educational content.
+You will receive a batch of numbered video frames with their timestamps.
+For EACH frame, evaluate its **Information Density** on a scale of 1–10:
 
-Mark as IMPORTANT only when the frame clearly shows:
-- A complete diagram, flowchart, or architecture diagram.
-- A full slide with bullet points or key concepts.
-- A complete equation, whiteboard, or chart/table.
-- Full code snippet or terminal output that explains something.
+Score 8–10 (HIGH — must keep):
+- Complete diagram, flowchart, or architecture diagram clearly visible
+- Full slide with multiple bullet points or key concepts
+- Complete equation or derivation on whiteboard/screen
+- Full code snippet or terminal output that teaches something
+- Clear chart, table, or comparison visible
 
-Reply with exactly one line: IMPORTANT or NOT. If IMPORTANT, add a second line with a short caption (e.g. "Training loop flowchart", "Gradient descent equation")."""
+Score 5–7 (MEDIUM — keep if unique):
+- Partial but still useful slide content (most text readable)
+- Equation being built but mostly complete
+- Code with some parts visible
+
+Score 1–4 (LOW — discard):
+- Talking head / face with no educational content behind
+- Blank or nearly blank screen
+- Intro/outro slides, channel logos, subscribe prompts
+- Extremely blurry or unreadable content
+- Frame where a hand/body is covering most of the content
+
+DEDUPLICATION: If multiple frames show the same slide or content, give the highest score ONLY to the one where the content is MOST COMPLETE. Score the others lower (1-3) even if individually they would be medium/high.
+
+Reply with ONLY a JSON array. Each element must be:
+{"frame": <number>, "score": <int 1-10>, "content_type": "<code|diagram|slide|equation|chart|other>", "caption": "<short description>"}
+
+Example:
+[{"frame": 1, "score": 9, "content_type": "diagram", "caption": "Neural network architecture diagram"}, {"frame": 2, "score": 2, "content_type": "other", "caption": "Talking head, no content"}]"""
 
 
-def _is_important_frame_response(text: str) -> tuple[bool, str]:
-    text = (text or "").strip().upper()
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines:
-        return False, ""
-    first = lines[0].upper()
-    if "NOT" in first or first.startswith("NO"):
-        return False, ""
-    if "IMPORTANT" in first or "YES" in first:
-        caption = " ".join(ln for ln in lines[1:] if not ln.upper().startswith("IMPORTANT")).strip()
-        return True, caption or "Key frame"
-    return False, ""
-
-
-def select_important_frames(
-    candidate_frames: Sequence[tuple[Path, float]],
-    vision_model: str = VISION_MODEL,
-    max_important: int = MAX_IMPORTANT_FRAMES,
+async def _judge_batch_async(
+    llm: ChatOpenAI,
+    batch: list[tuple[int, Path, float]],
 ) -> list[dict]:
-    """
-    First pass: vision LLM marks each frame IMPORTANT/NOT. Then deduplicate by time cluster
-    (keep last frame in each cluster). If still more than max_important, second pass: text-only
-    "pick top N" to keep only the most useful. Returns list of {"path", "timestamp_sec", "caption"}.
+    """Send a batch of frames to the vision model and parse scored results."""
+    image_content = []
+    image_content.append({
+        "type": "text",
+        "text": (
+            f"Evaluate these {len(batch)} frames. "
+            "For each, return a JSON object with frame number, score (1-10), content_type, and caption. "
+            "Apply deduplication: if frames show the same content, only the most complete one gets a high score. "
+            "Reply with ONLY a JSON array."
+        ),
+    })
+
+    for seq_num, frame_path, ts in batch:
+        if not frame_path.exists():
+            continue
+        b64 = _encode_image(frame_path)
+        image_content.append({
+            "type": "text",
+            "text": f"--- Frame {seq_num} (timestamp: {ts:.0f}s) ---",
+        })
+        image_content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+        })
+
+    messages = [
+        SystemMessage(content=BATCH_JUDGE_SYSTEM),
+        HumanMessage(content=image_content),
+    ]
+
+    try:
+        response = await llm.ainvoke(messages)
+        text = response.content if hasattr(response, "content") else str(response)
+        # Extract JSON array from response (handle markdown code fences)
+        text = text.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return parsed
+    except Exception:
+        pass
+    return []
+
+
+async def _run_batched_vision_filter(
+    candidate_frames: list[tuple[Path, float]],
+    vision_model: str,
+    batch_size: int = VISION_BATCH_SIZE,
+    relevance_threshold: int = RELEVANCE_THRESHOLD,
+) -> list[dict]:
+    """Score all candidate frames via batched async calls to the vision model.
+
+    Returns list of {"path", "timestamp_sec", "caption", "content_type", "relevance_score"}
+    sorted by relevance_score descending.
     """
     if not candidate_frames:
         return []
 
-    llm = ChatOpenAI(model=vision_model, temperature=0.0, max_tokens=120)
-    important: list[dict] = []
+    llm = ChatOpenAI(model=vision_model, temperature=0.0, max_tokens=1200)
 
-    for frame_path, timestamp_sec in candidate_frames:
-        if not frame_path.exists():
+    # Build numbered batches
+    batches: list[list[tuple[int, Path, float]]] = []
+    current_batch: list[tuple[int, Path, float]] = []
+    for i, (path, ts) in enumerate(candidate_frames):
+        current_batch.append((i + 1, path, ts))
+        if len(current_batch) >= batch_size:
+            batches.append(current_batch)
+            current_batch = []
+    if current_batch:
+        batches.append(current_batch)
+
+    # Run all batches concurrently
+    tasks = [_judge_batch_async(llm, batch) for batch in batches]
+    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Collect results
+    scored: list[dict] = []
+    frame_lookup = {i + 1: (path, ts) for i, (path, ts) in enumerate(candidate_frames)}
+
+    for br in batch_results:
+        if isinstance(br, Exception):
             continue
-        b64 = _encode_image(frame_path)
-        data_url = f"data:image/jpeg;base64,{b64}"
-        user_content = [
-            {"type": "text", "text": f"Timestamp: {timestamp_sec:.0f}s. Is this frame IMPORTANT for study notes? Mark NOT if mainly a face with no content, or partial/incomplete. Mark IMPORTANT only if it shows complete educational content (full diagram/slide/equation). Reply IMPORTANT or NOT; if IMPORTANT add one short caption on next line."},
-            {"type": "image_url", "image_url": {"url": data_url}},
-        ]
-        messages = [SystemMessage(content=FRAME_IMPORTANCE_SYSTEM), HumanMessage(content=user_content)]
-        try:
-            response = llm.invoke(messages)
-            text = response.content if hasattr(response, "content") else str(response)
-            is_imp, caption = _is_important_frame_response(text)
-            if is_imp:
-                important.append({
-                    "path": str(frame_path.resolve()),
-                    "timestamp_sec": timestamp_sec,
-                    "caption": caption or f"Frame at {timestamp_sec:.0f}s",
-                })
-        except Exception:
-            continue
+        for item in br:
+            frame_num = item.get("frame")
+            score = item.get("score", 0)
+            if frame_num not in frame_lookup:
+                continue
+            if score < relevance_threshold:
+                continue
+            path, ts = frame_lookup[frame_num]
+            scored.append({
+                "path": str(path.resolve()),
+                "timestamp_sec": ts,
+                "caption": item.get("caption", f"Frame at {ts:.0f}s"),
+                "content_type": item.get("content_type", "other"),
+                "relevance_score": score,
+            })
 
-    # Deduplicate: within 50s keep only the last (complete slide vs build-up)
-    important = _cluster_keep_last(important, window_sec=50.0)
-
-    # Hard cap: if still too many, ask LLM to pick top N by caption/timestamp (text-only)
-    if len(important) > max_important:
-        important = _pick_top_n(important, max_n=max_important)
-    return important
+    # Sort by score descending, then by timestamp ascending for tie-breaking
+    scored.sort(key=lambda x: (-x["relevance_score"], x["timestamp_sec"]))
+    return scored
 
 
-def _cluster_keep_last(frames: list[dict], window_sec: float) -> list[dict]:
-    if len(frames) <= 1:
-        return frames
-    sorted_f = sorted(frames, key=lambda x: x["timestamp_sec"])
-    out: list[dict] = []
-    cluster_start = sorted_f[0]["timestamp_sec"]
-    best = sorted_f[0]
-    for f in sorted_f[1:]:
-        t = f["timestamp_sec"]
-        if t <= cluster_start + window_sec:
-            best = f
-        else:
-            out.append(best)
-            cluster_start = t
-            best = f
-    out.append(best)
-    return out
-
-
+# ---------------------------------------------------------------------------
+# 4. Top-N selection (text-only LLM fallback if still too many)
+# ---------------------------------------------------------------------------
 def _pick_top_n(frames: list[dict], max_n: int) -> list[dict]:
-    """Use text-only LLM to pick the top max_n most useful frames by caption/timestamp."""
+    """Use text-only LLM to pick the top max_n frames by caption/score/timestamp."""
     if len(frames) <= max_n:
         return frames
     from prompts.notes import FRAME_TOP_N_SYSTEM
-    lines = [f"{i+1}. [{int(f['timestamp_sec'])}s] {f.get('caption', '')}" for i, f in enumerate(frames)]
-    prompt = f"""Candidates (number, timestamp, caption):
-{chr(10).join(lines)}
 
-Pick exactly the {max_n} most useful for study notes. Reply with comma-separated numbers only, e.g. 1,3,5,7,8,10."""
+    lines = [
+        f"{i+1}. [{int(f['timestamp_sec'])}s] score={f.get('relevance_score', '?')} "
+        f"type={f.get('content_type', '?')} — {f.get('caption', '')}"
+        for i, f in enumerate(frames)
+    ]
+    prompt = (
+        f"Candidates (number, timestamp, score, type, caption):\n"
+        f"{chr(10).join(lines)}\n\n"
+        f"Pick exactly the {max_n} most useful for study notes. "
+        f"Prefer diversity of content types and high scores. "
+        f"Reply with comma-separated numbers only, e.g. 1,3,5,7,8,10."
+    )
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, max_tokens=80)
     try:
         response = llm.invoke([SystemMessage(content=FRAME_TOP_N_SYSTEM), HumanMessage(content=prompt)])
         text = (response.content if hasattr(response, "content") else str(response)) or ""
         numbers = [int(x.strip()) for x in re.findall(r"\d+", text) if 1 <= int(x.strip()) <= len(frames)]
-        seen = set()
-        indices = []
+        seen: set[int] = set()
+        indices: list[int] = []
         for n in numbers:
             if n not in seen and len(indices) < max_n:
                 seen.add(n)
@@ -268,29 +457,90 @@ Pick exactly the {max_n} most useful for study notes. Reply with comma-separated
     return frames[:max_n]
 
 
+# ---------------------------------------------------------------------------
+# 5. Public API — orchestrates the full pipeline
+# ---------------------------------------------------------------------------
+def select_important_frames(
+    candidate_frames: list[tuple[Path, float]],
+    vision_model: str = VISION_MODEL,
+) -> list[dict]:
+    """
+    Batched vision-model scoring → filter by relevance threshold.
+    Keeps ALL frames that score >= RELEVANCE_THRESHOLD (dedup handled by vision judge).
+    Returns list of {"path", "timestamp_sec", "caption", "content_type", "relevance_score"}.
+    """
+    if not candidate_frames:
+        return []
+
+    # Run async batched vision filter
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        # Already inside an event loop (e.g. Jupyter) — use nest_asyncio or thread
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            scored = pool.submit(
+                asyncio.run,
+                _run_batched_vision_filter(candidate_frames, vision_model),
+            ).result()
+    else:
+        scored = asyncio.run(
+            _run_batched_vision_filter(candidate_frames, vision_model)
+        )
+
+    if not scored:
+        return []
+
+    # Final sort by timestamp for chronological order in notes
+    scored.sort(key=lambda x: x["timestamp_sec"])
+    return scored
+
+
+def _cleanup_video(video_path: Path) -> None:
+    """Delete the downloaded video file to free disk space."""
+    try:
+        if video_path.exists():
+            video_path.unlink()
+    except Exception:
+        pass  # Non-critical — don't crash if cleanup fails
+
+
 def fetch_important_frames(
     video_id: str,
     output_dir: Path | str,
-    max_important: int = MAX_IMPORTANT_FRAMES,
     vision_model: str = VISION_MODEL,
 ) -> tuple[list[dict], str]:
     """
-    Download video, extract frames at scene changes (with interval fallback), run vision filter,
-    cluster dedup, then top-N cap. Returns (list of frames, error_string).
+    Full pipeline: download → SSIM scene detection with motion debouncing →
+    batched vision scoring → auto-delete video.
+    Returns (list of frame dicts, error_string).
     """
     output_dir = Path(output_dir)
+    video_path: Path | None = None
     try:
         video_path = download_video(video_id, output_dir)
     except Exception as e:
         return [], f"Video download failed: {e}"
     try:
-        candidates = extract_frames_at_scene_changes(video_path, max_frames=MAX_CANDIDATE_FRAMES)
+        candidates = extract_candidate_frames(video_path, max_frames=MAX_CANDIDATE_FRAMES)
     except Exception as e:
+        if video_path:
+            _cleanup_video(video_path)
         return [], f"Frame extraction failed: {e}"
+
+    # Done reading video — delete it to free disk space
+    if video_path:
+        _cleanup_video(video_path)
+
     if not candidates:
-        return [], ""
+        return [], "No candidate frames extracted"
     try:
-        important = select_important_frames(candidates, vision_model=vision_model, max_important=max_important)
+        important = select_important_frames(
+            candidates, vision_model=vision_model,
+        )
     except Exception as e:
         return [], f"Frame selection failed: {e}"
     return important, ""

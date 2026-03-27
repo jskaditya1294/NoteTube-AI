@@ -7,7 +7,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 
 from core.state import NotesWorkflowState, MAX_ITERATIONS
 from services.video import extract_video_id, get_transcript
-from services.frames import fetch_important_frames, MAX_IMPORTANT_FRAMES
+from services.frames import fetch_important_frames
 from prompts.notes import (
     NOTES_GENERATOR_SYSTEM,
     NOTES_REVISER_SYSTEM,
@@ -105,19 +105,15 @@ def fetch_transcript(state: NotesWorkflowState) -> dict:
 
 
 def fetch_important_frames_node(state: NotesWorkflowState) -> dict:
-    """Extract most useful frames: scene-based sampling, vision filter, top-N cap."""
+    """Extract most useful frames: SSIM scene detection, batched vision scoring, auto-cleanup video."""
     video_id = state.get("video_id") or ""
     if not video_id:
         return {"important_frames": [], "frames_error": "Missing video_id"}
     output_dir = state.get("output_dir") or "outputs"
-    max_important = state.get("max_important_frames")
-    if max_important is None:
-        max_important = MAX_IMPORTANT_FRAMES
     try:
         important, err = fetch_important_frames(
             video_id=video_id,
             output_dir=Path(output_dir),
-            max_important=int(max_important),
         )
         return {"important_frames": important, "frames_error": err or ""}
     except Exception as e:
