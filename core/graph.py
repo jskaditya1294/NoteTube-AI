@@ -5,8 +5,8 @@ from typing import Literal
 from langgraph.graph import StateGraph, START, END
 
 from core.state import NotesWorkflowState, MAX_ITERATIONS
-from nodes.notes import fetch_transcript, fetch_important_frames_node, generate_notes, review_quality, revise_notes, generate_notes_qa
-from nodes.interview import (
+from nodes.notes_nodes import fetch_transcript, fetch_important_frames_node, generate_notes, review_quality, revise_notes, generate_notes_qa
+from nodes.interview_nodes import (
     interview_topic_miner,
     interview_question_harvester,
     interview_critic,
@@ -61,20 +61,24 @@ workflow.add_edge(START, "fetch_transcript")
 workflow.add_conditional_edges(
     "fetch_transcript",
     route_after_fetch,
-    {"continue": "fetch_important_frames", "end": END},
+    {"continue": "generate_notes", "end": END},
 )
-workflow.add_edge("fetch_important_frames", "generate_notes")
+# #2: Notes generation starts immediately after transcript — no blocking on frame download.
+# Frames are fetched after the review loop, since they're only needed for final file export.
 workflow.add_edge("generate_notes", "review_quality")
 workflow.add_conditional_edges(
     "review_quality",
     route_after_review,
     {
-        "pass": "generate_notes_qa",
-        "pass_skip_interview": "generate_notes_qa",
+        "pass": "fetch_important_frames",
+        "pass_skip_interview": "fetch_important_frames",
         "revise": "revise_notes",
     },
 )
 workflow.add_edge("revise_notes", "review_quality")
+
+# After frames, continue to QA
+workflow.add_edge("fetch_important_frames", "generate_notes_qa")
 
 # After notes QA: either continue to interview mining or end
 workflow.add_conditional_edges(

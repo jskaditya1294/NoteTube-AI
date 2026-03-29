@@ -74,11 +74,18 @@ def download_video(video_id: str, output_dir: Path) -> Path:
 # 2. SSIM-based adaptive scene-change detection with motion debouncing
 # ---------------------------------------------------------------------------
 def _compute_ssim(img_a, img_b) -> float:
-    """Compute simplified SSIM between two grayscale images (same shape).
+    """Compute SSIM between two grayscale images (same shape).
 
-    Uses the standard SSIM formula with default constants.
+    Uses scikit-image's windowed SSIM if available (more accurate for local changes
+    like a new line on a slide), otherwise falls back to global-mean SSIM.
     Returns value in [-1, 1]; 1 = identical.
     """
+    try:
+        from skimage.metrics import structural_similarity
+        return float(structural_similarity(img_a, img_b))
+    except ImportError:
+        pass
+
     import numpy as np
 
     a = img_a.astype(np.float64)
@@ -425,7 +432,7 @@ def _pick_top_n(frames: list[dict], max_n: int) -> list[dict]:
     """Use text-only LLM to pick the top max_n frames by caption/score/timestamp."""
     if len(frames) <= max_n:
         return frames
-    from prompts.notes import FRAME_TOP_N_SYSTEM
+    from prompts.notes_prompts import FRAME_TOP_N_SYSTEM
 
     lines = [
         f"{i+1}. [{int(f['timestamp_sec'])}s] score={f.get('relevance_score', '?')} "

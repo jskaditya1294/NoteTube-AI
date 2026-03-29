@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
-from typing import Any
+from typing import Any, List, Optional
 
+from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from core.state import NotesWorkflowState, MAX_INTERVIEW_LOOPS
-from prompts.interview import (
+from prompts.interview_prompts import (
     NODE1_TOPIC_MINER_SYSTEM,
     NODE2_QUESTION_HARVESTER_SYSTEM,
     NODE2_QUESTION_HARVESTER_RETRY,
@@ -22,11 +24,80 @@ from services.search import (
     build_global_queries_from_topics,
 )
 
-_llm = ChatOpenAI(model="gpt-5.1", temperature=0.1)
-_llm_fast = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
+logger = logging.getLogger(__name__)
+
+
+# ── Structured output schemas ──
+
+class TopicEvidence(BaseModel):
+    source: str = Field(description="'transcript' or 'notes'")
+    quote: str = Field(description="Exact words from the material proving this topic is covered.")
+
+class MinedTopic(BaseModel):
+    topic: str = Field(description="Search-friendly topic name, e.g. 'Gradient Descent Variants'.")
+    aliases: List[str] = Field(description="Alternative names or abbreviations for the topic.")
+    category: str = Field(description="Broad ML/AI category, e.g. 'Optimization', 'Regularization'.")
+    evidence: TopicEvidence
+    priority: str = Field(description="High, Medium, or Low based on how central the topic is.")
+
+class TopicMinerResult(BaseModel):
+    topics: List[MinedTopic] = Field(description="All topics extracted from the material.")
+    topic_coverage_notes: str = Field(description="1-3 sentence summary of what the material covers.")
+
+
+class HarvestedQuestion(BaseModel):
+    topic: str = Field(description="Closest matching topic from the provided topic list.")
+    company: str = Field(description="Company name from the same TITLE/CONTENT block.")
+    role_level: str = Field(default="", description="Role or level if mentioned, e.g. 'L4 MLE'.")
+    question_text: str = Field(description="Verbatim interview question from the source.")
+    source_url: str = Field(description="Exact SOURCE_URL for the block containing this question.")
+    evidence_snippet: str = Field(description="1-4 lines from CONTENT/TITLE showing question + company context.")
+    other_sources: List[str] = Field(default_factory=list, description="Additional URLs if found elsewhere.")
+
+class SearchCoverage(BaseModel):
+    topic: str
+    sources_used: List[str] = Field(default_factory=list)
+    notes: str = ""
+
+class ExcludedQuestion(BaseModel):
+    topic: str = ""
+    question_text: str = ""
+    reason: str = ""
+
+class QuestionHarvestResult(BaseModel):
+    question_bank: List[HarvestedQuestion] = Field(default_factory=list)
+    search_coverage: List[SearchCoverage] = Field(default_factory=list)
+    excluded_unattributed: List[ExcludedQuestion] = Field(default_factory=list)
+
+
+class CriticIssue(BaseModel):
+    type: str = Field(description="Issue category, e.g. 'missing_topic', 'low_question_count'.")
+    details: str
+    fix_instructions: str
+
+class CriticLoopInstructions(BaseModel):
+    target_node: str = Field(description="'Node1' or 'Node2'")
+    priority_topics: List[str] = Field(default_factory=list)
+    search_queries_to_try: List[str] = Field(default_factory=list)
+
+class CriticResult(BaseModel):
+    decision: str = Field(description="APPROVE_AND_EXPORT, REVISE_TOPICS, or RESEARCH_MORE.")
+    issues: List[CriticIssue] = Field(default_factory=list)
+    loop_instructions: CriticLoopInstructions
+
+
+# ── LLMs (#3: max_retries for resilience) ──
+
+_llm = ChatOpenAI(model="gpt-5.1", temperature=0.1, max_retries=3)
+_llm_fast = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, max_retries=3)
+
+_topic_miner_structured = _llm.with_structured_output(TopicMinerResult)
+_question_harvester_structured = _llm.with_structured_output(QuestionHarvestResult)
+_critic_structured = _llm_fast.with_structured_output(CriticResult)
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
+    """Fallback JSON extractor — used only when structured output fails."""
     text = (text or "").strip()
     if "```" in text:
         m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
@@ -50,12 +121,13 @@ def _extract_json_object(text: str) -> dict[str, Any]:
 
 
 def interview_topic_miner(state: NotesWorkflowState) -> dict[str, Any]:
-    transcript = (state.get("transcript") or "")[:120000]
+    transcript = (state.get("transcript") or "")[:60000]
     notes = (state.get("notes") or "")[:80000]
     feedback = state.get("feedback_node1") or ""
+
     user = f"""Transcript (excerpt if long):
 ---
-{transcript[:60000]}
+{transcript}
 ---
 
 Notes:
@@ -64,24 +136,50 @@ Notes:
 ---
 
 Prior critic feedback for topics (follow if non-empty):
-{feedback}
+{feedback}"""
 
-Output STRICT JSON only per schema in system message."""
-    r = _llm.invoke([SystemMessage(content=NODE1_TOPIC_MINER_SYSTEM), HumanMessage(content=user)])
-    text = r.content if hasattr(r, "content") else str(r)
-    data = _extract_json_object(text)
-    topics = data.get("topics") or []
-    if not topics:
+    messages = [
+        SystemMessage(content=NODE1_TOPIC_MINER_SYSTEM),
+        HumanMessage(content=user),
+    ]
+
+    try:
+        result: TopicMinerResult = _topic_miner_structured.invoke(messages)
+        data = result.model_dump()
+    except Exception:
+        # Fallback to raw LLM + manual parse if structured output fails
+        r = _llm.invoke(messages)
+        text = r.content if hasattr(r, "content") else str(r)
+        data = _extract_json_object(text)
+
+    if not data.get("topics"):
         data = {
             "topics": [],
             "topic_coverage_notes": data.get("topic_coverage_notes") or "No topics extracted.",
         }
+
     out: dict[str, Any] = {"topics_data": data}
     if (state.get("feedback_node1") or "").strip():
         out["question_bank"] = []
         out["excluded_unattributed"] = []
         out["search_coverage"] = []
     return out
+
+
+def _invoke_harvester(system: str, user: str) -> QuestionHarvestResult:
+    """Invoke question harvester with structured output, falling back to manual parse."""
+    messages = [SystemMessage(content=system), HumanMessage(content=user)]
+    try:
+        return _question_harvester_structured.invoke(messages)
+    except Exception:
+        r = _llm.invoke(messages)
+        text = r.content if hasattr(r, "content") else str(r)
+        data = _extract_json_object(text)
+        return QuestionHarvestResult(**{
+            "question_bank": data.get("question_bank") or [],
+            "search_coverage": data.get("search_coverage") or [],
+            "excluded_unattributed": data.get("excluded_unattributed") or [],
+        })
 
 
 def interview_question_harvester(state: NotesWorkflowState) -> dict[str, Any]:
@@ -138,32 +236,25 @@ def interview_question_harvester(state: NotesWorkflowState) -> dict[str, Any]:
 {topics_json}
 
 WEB SOURCES (each block: SOURCE_URL, TITLE, CONTENT — extract from CONTENT/TITLE only):
-{blob[:195000]}
+{blob[:195000]}"""
 
-Output STRICT JSON."""
+    result = _invoke_harvester(NODE2_QUESTION_HARVESTER_SYSTEM, user)
+    qb = [q.model_dump() if isinstance(q, BaseModel) else q for q in result.question_bank]
 
-    r = _llm.invoke([SystemMessage(content=NODE2_QUESTION_HARVESTER_SYSTEM), HumanMessage(content=user)])
-    text = r.content if hasattr(r, "content") else str(r)
-    data = _extract_json_object(text)
-    qb = data.get("question_bank") or []
+    # #19: Skip retry/emergency on loop iterations > 0 — we've already tried hard enough
+    interview_loop = state.get("interview_loop") or 0
 
-    if len(qb) < 4 and len(blob) > 4000:
-        r2 = _llm.invoke([
-            SystemMessage(
-                content=NODE2_QUESTION_HARVESTER_SYSTEM + "\n\n" + NODE2_QUESTION_HARVESTER_RETRY
-            ),
-            HumanMessage(content=user),
-        ])
-        data2 = _extract_json_object(r2.content if hasattr(r2, "content") else str(r2))
-        qb2 = data2.get("question_bank") or []
+    if len(qb) < 4 and len(blob) > 4000 and interview_loop == 0:
+        result2 = _invoke_harvester(
+            NODE2_QUESTION_HARVESTER_SYSTEM + "\n\n" + NODE2_QUESTION_HARVESTER_RETRY,
+            user,
+        )
+        qb2 = [q.model_dump() if isinstance(q, BaseModel) else q for q in result2.question_bank]
         if len(qb2) > len(qb):
             qb = qb2
-            data = data2
-        elif not qb and qb2:
-            qb = qb2
-            data = data2
+            result = result2
 
-    if len(qb) < 3 and len(blob) > 3000:
+    if len(qb) < 3 and len(blob) > 3000 and interview_loop == 0:
         emergency = [
             "FAANG machine learning interview questions 2024",
             "Google Meta Amazon data scientist interview questions list",
@@ -171,28 +262,23 @@ Output STRICT JSON."""
         ] + deduped[:8]
         _, blob_em = gather_interview_source_blob(emergency, max_queries=14)
         if len(blob_em) > 2500:
-            r3 = _llm.invoke([
-                SystemMessage(content=NODE2_QUESTION_HARVESTER_SYSTEM),
-                HumanMessage(
-                    content=f"Topics JSON:\n{topics_json}\n\nADDITIONAL WEB SOURCES:\n{blob_em[:120000]}\n\nOutput STRICT JSON."
-                ),
-            ])
-            qb3 = _extract_json_object(r3.content if hasattr(r3, "content") else str(r3)).get(
-                "question_bank"
-            ) or []
+            result3 = _invoke_harvester(
+                NODE2_QUESTION_HARVESTER_SYSTEM,
+                f"Topics JSON:\n{topics_json}\n\nADDITIONAL WEB SOURCES:\n{blob_em[:120000]}",
+            )
+            qb3 = [q.model_dump() if isinstance(q, BaseModel) else q for q in result3.question_bank]
+            existing_keys = {
+                (str(x.get("question_text", "")).strip().lower(), str(x.get("company", "")).strip().lower())
+                for x in qb
+            }
             for q in qb3:
-                k = (
-                    str(q.get("question_text", "")).strip().lower(),
-                    str(q.get("company", "")).strip().lower(),
-                )
-                if k[0] and not any(
-                    str(x.get("question_text", "")).strip().lower() == k[0]
-                    and str(x.get("company", "")).strip().lower() == k[1]
-                    for x in qb
-                ):
+                k = (str(q.get("question_text", "")).strip().lower(), str(q.get("company", "")).strip().lower())
+                if k[0] and k not in existing_keys:
+                    existing_keys.add(k)
                     qb.append(q)
-    excl = data.get("excluded_unattributed") or []
-    sc = data.get("search_coverage") or coverage_meta
+
+    excl = [e.model_dump() if isinstance(e, BaseModel) else e for e in result.excluded_unattributed]
+    sc = [s.model_dump() if isinstance(s, BaseModel) else s for s in result.search_coverage] or coverage_meta
 
     old_qb = state.get("question_bank") or []
     if old_qb:
@@ -222,12 +308,6 @@ def interview_critic(state: NotesWorkflowState) -> dict[str, Any]:
     qb = state.get("question_bank") or []
     loop = state.get("interview_loop") or 0
 
-    summary = {
-        "num_topics": len(topics_data.get("topics") or []),
-        "num_questions": len(qb),
-        "companies": list({q.get("company") for q in qb if q.get("company")})[:30],
-        "sample_questions": qb[:5],
-    }
     user = f"""Loop iteration: {loop} / {MAX_INTERVIEW_LOOPS}
 
 Topics JSON (abbreviated):
@@ -238,12 +318,18 @@ Question bank sample (full list truncated if huge):
 {json.dumps(qb[:40], ensure_ascii=False)[:25000]}
 
 Decide: APPROVE_AND_EXPORT, REVISE_TOPICS, or RESEARCH_MORE.
-If iteration >= {MAX_INTERVIEW_LOOPS - 1}, prefer APPROVE unless data is empty.
+If iteration >= {MAX_INTERVIEW_LOOPS - 1}, prefer APPROVE unless data is empty."""
 
-Output STRICT JSON only."""
-    r = _llm_fast.invoke([SystemMessage(content=NODE3_CRITIC_SYSTEM), HumanMessage(content=user)])
-    text = r.content if hasattr(r, "content") else str(r)
-    data = _extract_json_object(text)
+    messages = [SystemMessage(content=NODE3_CRITIC_SYSTEM), HumanMessage(content=user)]
+
+    try:
+        result: CriticResult = _critic_structured.invoke(messages)
+        data = result.model_dump()
+    except Exception:
+        r = _llm_fast.invoke(messages)
+        text = r.content if hasattr(r, "content") else str(r)
+        data = _extract_json_object(text)
+
     decision = (data.get("decision") or "APPROVE_AND_EXPORT").upper()
     if "REVISE" in decision:
         decision = "REVISE_TOPICS"

@@ -5,7 +5,9 @@ youtube-transcript-api
 python-dotenv
 python-docx
 yt-dlp
-opencv-python
+opencv-python-headless
 numpy
 duckduckgo-search
 tavily-python
+tiktoken
+scikit-image

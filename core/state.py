@@ -5,11 +5,15 @@ from typing import Any, TypedDict
 MAX_ITERATIONS = 3
 MAX_INTERVIEW_LOOPS = 3
 
+#NotesWorkflowState is not “data” — it is the workflow’s memory.
+#Every step reads from it, writes to it, and passes it forward.
+
 
 class NotesWorkflowState(TypedDict, total=False):
     # Notes pipeline
     video_id: str
     transcript: str
+    chapters: list[dict]
     output_dir: str
     max_important_frames: int
     important_frames: list[dict]

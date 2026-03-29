@@ -1,10 +1,12 @@
 # # """YouTube video ID extraction and transcript fetching."""
 
 
+import logging
 import re
 from urllib.parse import parse_qs, urlparse
 from typing import Sequence
 
+import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
     TranscriptsDisabled,
@@ -15,6 +17,7 @@ from youtube_transcript_api._errors import (
 )
 
 VIDEO_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{11}$")
+logger = logging.getLogger(__name__)
 
 
 def extract_video_id(input_str: str) -> str:
@@ -100,4 +103,42 @@ def get_transcript(video_id: str, languages: Sequence[str] | None = None) -> str
     ):
         raise
 
-    return " ".join(snippet.text for snippet in fetched_transcript)
+    # #7: Preserve timestamps — enables future "link to video time" features.
+    # Format: [MM:SS] text (lightweight, stripped by chunker's normalize_transcript)
+    parts: list[str] = []
+    for snippet in fetched_transcript:
+        ts = int(getattr(snippet, "start", 0))
+        mm, ss = divmod(ts, 60)
+        parts.append(f"[{mm:02d}:{ss:02d}] {snippet.text}")
+    return "\n".join(parts)
+
+
+def get_chapters(video_id: str) -> list[dict]:
+    """Fetch YouTube chapter markers via yt-dlp metadata (no download).
+
+    Returns list of ``{"title": str, "start_time": float}`` sorted by start_time.
+    Returns empty list if the video has no chapters or on any error.
+    """
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        # Only need metadata — no formats, thumbnails, etc.
+        "extract_flat": False,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            raw_chapters = info.get("chapters") or []
+            chapters = [
+                {"title": ch["title"].strip(), "start_time": float(ch["start_time"])}
+                for ch in raw_chapters
+                if ch.get("title")
+            ]
+            chapters.sort(key=lambda c: c["start_time"])
+            logger.info("Found %d YouTube chapters for %s", len(chapters), video_id)
+            return chapters
+    except Exception as e:
+        logger.warning("Could not fetch chapters for %s: %s", video_id, e)
+        return []

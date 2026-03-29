@@ -104,6 +104,7 @@ Your task:
 Rules:
 - Combine overlapping sections where appropriate
 - Do NOT remove rare but important technical details, caveats, or distinctions
+- Do NOT drop sections just because they appear in only one partial note set — they may represent unique topics
 - Keep the final notes concise but comprehensive
 - Do NOT add introductions, summaries, conclusions, or narrative transitions
 - Use the most descriptive topic title from the partial notes as the final `# Title`
@@ -145,10 +146,10 @@ Evaluation Criteria:
 4. Formatting: Is it clean, professional, and easy to skim?
 5. Math format: Equations must use KaTeX (LaTeX) notation — $...$ for inline, $$...$$ for display. FAIL if plain-text hacks (e.g. e^(-x), d/dx, backtick-wrapped math) appear instead of proper LaTeX.
 
-Response Protocol:
-- Start your response with EXACTLY one word: PASS or FAIL.
-- If FAIL: Provide a numbered list of specific improvements. Be pedantic about "paragraph-style" text, missing technical terms, or invalid math formatting.
-- If PASS: Provide a one-sentence confirmation of why the notes are high-quality.
+Response:
+- Set passed to true (PASS) or false (FAIL).
+- If FAIL: provide a numbered list of specific improvements in the feedback field. Be pedantic about "paragraph-style" text, missing technical terms, or invalid math formatting.
+- If PASS: provide a one-sentence confirmation of why the notes are high-quality in the feedback field.
 """
 
 
@@ -164,28 +165,16 @@ def user_prompt_revise_notes(transcript: str, current_notes: str, feedback: str)
 
 def user_prompt_review(transcript: str, notes: str) -> str:
     """User message for the reviewer."""
-    return f"""Transcript:\n---\n{transcript}\n---\n\nNotes to review:\n---\n{notes}\n---\n\nAssess and reply with PASS or FAIL and optional feedback."""
-
-
-def parse_review_response(response_text: str) -> tuple[bool, str]:
-    """
-    Parse reviewer LLM output. Returns (review_passed: bool, review_feedback: str).
-    Looks for PASS or FAIL at the start (case-insensitive); rest is feedback.
-    """
-    text = (response_text or "").strip()
-    upper = text.upper()
-    if upper.startswith("PASS"):
-        return True, text[4:].strip() or "Approved."
-    if upper.startswith("FAIL"):
-        return False, text[4:].strip() or "Needs improvement."
-    # Default: treat as fail with full text as feedback (safe choice)
-    return False, text or "Could not parse review."
+    return f"""Transcript (excerpt for reference):\n---\n{transcript}\n---\n\nNotes to review:\n---\n{notes}\n---\n\nAssess the notes against the transcript and provide your verdict."""
 
 
 def user_prompt_generate_chunk_notes(chunk_text: str, chunk_index: int, total_chunks: int) -> str:
     return f"""Create structured study notes from transcript chunk {chunk_index} of {total_chunks}.
 
 Important: Do NOT reference "this chunk", chunk numbers, or partial context in your output. Write as if these are standalone notes.
+
+If the transcript contains lines like [SECTION: Title], these are the video's chapter/topic markers.
+Use them as section headings (## Title) in your notes and make sure every concept within that section is fully captured.
 
 Transcript chunk:
 ---
@@ -241,12 +230,25 @@ def user_prompt_generate_qa(notes: str) -> str:
 Return only the Q&A in the required format."""
 
 
-def user_prompt_merge_chunk_notes(partial_notes: list[str]) -> str:
+def user_prompt_merge_chunk_notes(partial_notes: list[str], input_headings: list[str] | None = None) -> str:
     joined = "\n\n====================\n\n".join(
         f"PARTIAL NOTES {i+1}:\n{notes}" for i, notes in enumerate(partial_notes)
     )
-    return f"""Merge the following partial note sets into one final coherent note set.
 
+    # Build section manifest so the LLM knows exactly which sections must survive
+    manifest = ""
+    if input_headings:
+        unique = sorted(set(input_headings))
+        manifest = (
+            "\n\nSECTION MANIFEST — the following sections exist across the partial notes. "
+            "Every one of these MUST appear in the merged output (possibly renamed or combined "
+            "with a closely related section, but NEVER silently dropped):\n"
+            + "\n".join(f"  - {h}" for h in unique)
+            + "\n"
+        )
+
+    return f"""Merge the following partial note sets into one final coherent note set.
+{manifest}
 {joined}
 
 Return only the merged notes in the required format.

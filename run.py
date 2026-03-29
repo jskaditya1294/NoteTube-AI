@@ -3,6 +3,7 @@
 """CLI: accept video ID or URL, run workflow, print final notes, save final notes, save graph PNG."""
 
 import argparse
+import logging
 import re
 import shutil
 from pathlib import Path
@@ -20,7 +21,10 @@ from core.state import NotesWorkflowState
 from utils.export import (
     save_notes_as_md_and_docx,
     save_combined_questions,
+    _safe_filename,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def main() -> None:
@@ -35,16 +39,6 @@ def main() -> None:
         "--output-dir",
         default="outputs",
         help="Folder where final notes files will be saved"
-    )
-    parser.add_argument(
-        "--save-graph-png",
-        action="store_true",
-        help="Save the LangGraph workflow as a PNG flowchart"
-    )
-    parser.add_argument(
-        "--save-graph-mermaid",
-        action="store_true",
-        help="Save the LangGraph workflow Mermaid text to a .mmd file"
     )
     parser.add_argument(
         "--skip-interview",
@@ -63,22 +57,13 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save graph as PNG flowchart
+    # Always save workflow graph at the start of every run
     try:
         png_path = out_dir / "workflow_graph.png"
         graph.get_graph().draw_mermaid_png(output_file_path=str(png_path))
-        print(f"Saved graph PNG to: {png_path.resolve()}")
+        print(f"Workflow graph saved to: {png_path.resolve()}")
     except Exception as e:
-        print("Graph PNG save failed:", str(e))
-
-    # Save graph as Mermaid text
-    if args.save_graph_mermaid:
-        try:
-            mermaid_path = out_dir / "workflow_graph.mmd"
-            mermaid_path.write_text(graph.get_graph().draw_mermaid(), encoding="utf-8")
-            print(f"Saved Mermaid graph to: {mermaid_path.resolve()}")
-        except Exception as e:
-            print("Graph Mermaid save failed:", str(e))
+        print(f"Workflow graph save failed: {e}")
 
     initial_state: NotesWorkflowState = {
         "video_id": video_id,
@@ -98,7 +83,16 @@ def main() -> None:
         "node2_extra_queries": [],
     }
 
-    result = graph.invoke(initial_state)
+    # #10: Wrap graph invocation with error handling
+    try:
+        result = graph.invoke(initial_state)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+        return
+    except Exception as e:
+        logger.exception("Workflow failed")
+        print(f"Workflow failed: {e}")
+        return
 
     if result.get("error"):
         print("Error:", result["error"])
@@ -129,9 +123,8 @@ def main() -> None:
             if not topic_title:
                 topic_title = f"YouTube_Notes_{video_id}"
 
-            # Create topic folder under output dir
-            safe_topic = re.sub(r'[<>:"/\\|?*\n]+', "_", topic_title)
-            safe_topic = re.sub(r"\s+", "_", safe_topic)[:120]
+            # Create topic folder under output dir (#20: reuse _safe_filename from export)
+            safe_topic = _safe_filename(topic_title)
             topic_dir = out_dir / safe_topic
             topic_dir.mkdir(parents=True, exist_ok=True)
 

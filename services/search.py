@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import List, Tuple
+
+logger = logging.getLogger(__name__)
 
 try:
     from dotenv import load_dotenv
@@ -158,13 +161,21 @@ def build_search_queries_for_topic(topic: str, aliases: List[str], extra: List[s
 
 
 def build_global_queries_from_topics(topics: List[dict]) -> List[str]:
-    """Merge top topic names into broad searches (fewer redundant micro-topic searches)."""
+    """Build broad cross-topic search queries dynamically from actual topic names."""
     names = [t.get("topic") or "" for t in topics[:6] if t.get("topic")]
-    blob = " ".join(names[:4])[:100].strip()
-    return [
-        "gradient descent stochastic batch mini-batch machine learning interview questions Google Meta Amazon",
-        "backpropagation training loop interview question data scientist",
-        f"{blob} ML engineer interview questions companies",
-        "keras batch_size gradient descent interview",
-        "learning rate gradient descent interview question FAANG",
+    if not names:
+        return []
+
+    # Build topic-aware queries instead of hardcoded ones
+    blob_short = " ".join(names[:3])[:80].strip()
+    blob_long = " ".join(names[:5])[:120].strip()
+    queries = [
+        f"{blob_short} machine learning interview questions Google Meta Amazon",
+        f"{blob_long} data scientist interview questions FAANG",
+        f"{names[0]} ML engineer interview questions companies",
     ]
+    if len(names) > 1:
+        queries.append(f"{names[1]} AI engineer interview question experience")
+    if len(names) > 2:
+        queries.append(f"{names[2]} deep learning interview asked at company")
+    return queries
